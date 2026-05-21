@@ -1,10 +1,24 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, RemoteAuth } = require('whatsapp-web.js');
+const { MongoStore } = require('wwebjs-mongo');
+const mongoose = require('mongoose');
+const { createClient } = require('@supabase/supabase-js');
 
-function initializeWhatsApp(tenantId, tenantData, classifyFn) {
+// Initialize Supabase Client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+function initializeWhatsApp(tenantId, classifyFn) {
     console.log(`Initializing WhatsApp Client for Tenant: ${tenantId}...`);
     
+    const store = new MongoStore({ mongoose: mongoose });
+
     const client = new Client({
-        authStrategy: new LocalAuth({ clientId: tenantId }),
+        authStrategy: new RemoteAuth({ 
+            clientId: tenantId,
+            store: store,
+            backupSyncIntervalMs: 300000
+        }),
         puppeteer: {
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
             args: [
@@ -14,37 +28,39 @@ function initializeWhatsApp(tenantId, tenantData, classifyFn) {
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--single-process',
+                '--memory-pressure-off'
             ]
         }
     });
 
-    client.on('qr', qr => {
+    client.on('remote_session_saved', () => {
+        console.log(`[${tenantId}] Remote Session explicitly saved to MongoDB.`);
+    });
+
+    client.on('qr', async qr => {
         console.log(`[${tenantId}] QR Code Received`);
-        tenantData.status = 'disconnected';
-        tenantData.qr = qr;
+        await supabase.from('tenants').update({ status: 'disconnected', qr: qr }).eq('tenant_id', tenantId);
     });
 
-    client.on('authenticated', () => {
+    client.on('authenticated', async () => {
         console.log(`[${tenantId}] AUTHENTICATED successfully!`);
-        tenantData.status = 'authenticating';
-        tenantData.qr = null;
+        await supabase.from('tenants').update({ status: 'authenticating', qr: null }).eq('tenant_id', tenantId);
     });
 
-    client.on('auth_failure', msg => {
+    client.on('auth_failure', async msg => {
         console.error(`[${tenantId}] AUTHENTICATION FAILURE`, msg);
-        tenantData.status = 'disconnected';
+        await supabase.from('tenants').update({ status: 'disconnected' }).eq('tenant_id', tenantId);
     });
 
     client.on('ready', async () => {
         console.log(`[${tenantId}] WhatsApp Client is ready!`);
-        tenantData.status = 'connected';
-        tenantData.qr = null;
+        let number = 'Device Connected';
         if (client.info && client.info.wid) {
-            tenantData.number = '+' + client.info.wid.user;
-        } else {
-            tenantData.number = 'Device Connected';
+            number = '+' + client.info.wid.user;
         }
+        await supabase.from('tenants').update({ status: 'connected', qr: null, number: number }).eq('tenant_id', tenantId);
     });
 
     client.on('message', async msg => {
@@ -53,34 +69,35 @@ function initializeWhatsApp(tenantId, tenantData, classifyFn) {
 
         console.log(`[${tenantId}] MESSAGE RECEIVED:`, msg.body);
         
-        // Use custom local rule classification specific to this tenant
-        const classification = classifyFn(msg.body, tenantData.rules);
+        // Fetch current rules from Supabase for classification
+        const { data: tenant } = await supabase.from('tenants').select('rules').eq('tenant_id', tenantId).single();
+        const rules = tenant?.rules || [];
+        
+        const classification = classifyFn(msg.body, rules);
         
         let senderName = msg._data?.notifyName || msg.from.split('@')[0];
         let groupName = msg.from.includes('@g.us') ? 'WhatsApp Group' : 'Direct Message';
         
         const newMsg = {
             id: msg.id._serialized,
+            tenant_id: tenantId,
             sender: senderName,
-            group: groupName,
+            group_name: groupName,
             message: msg.body,
             time: new Date().toLocaleTimeString(),
             severity: classification.severity,
-            aiLabel: classification.label,
+            ai_label: classification.label,
             confidence: classification.confidence
         };
         
-        tenantData.messages.unshift(newMsg);
-        
-        // Keep only last 100 messages in memory per tenant
-        if (tenantData.messages.length > 100) {
-            tenantData.messages.pop();
-        }
+        // Save to Supabase
+        const { error } = await supabase.from('messages').insert([newMsg]);
+        if (error) console.error(`[${tenantId}] Error saving message to Supabase:`, error.message);
     });
 
-    client.initialize().catch(err => {
+    client.initialize().catch(async err => {
         console.error(`[${tenantId}] Initialization Error:`, err);
-        tenantData.isInitializing = false;
+        await supabase.from('tenants').update({ is_initializing: false }).eq('tenant_id', tenantId);
     });
 }
 

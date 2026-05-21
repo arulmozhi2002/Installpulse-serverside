@@ -1,6 +1,8 @@
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
+const mongoose = require('mongoose')
+const { createClient } = require('@supabase/supabase-js');
 const { initializeWhatsApp } = require('./whatsapp')
 
 const app = express()
@@ -9,11 +11,14 @@ const port = process.env.PORT || 3000
 app.use(cors())
 app.use(express.json())
 
-// Multi-tenant in-memory store
-const tenants = {}
+// Initialize Supabase Client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Helper to classify locally using custom rules
 const classifyLocally = (text, rules) => {
+  if (!rules) return { severity: 'warning', label: 'Unclassified', confidence: 0 };
   const lowerText = text.toLowerCase();
   for (const rule of rules) {
     if (rule.active && lowerText.includes(rule.keyword.toLowerCase())) {
@@ -23,38 +28,45 @@ const classifyLocally = (text, rules) => {
   return { severity: 'warning', label: 'Unclassified', confidence: 0 };
 }
 
-// Get or create tenant
-function getTenant(tenantId) {
-    if (!tenants[tenantId]) {
-        tenants[tenantId] = {
+// Get or create tenant in Supabase
+async function getTenant(tenantId) {
+    let { data: tenant, error } = await supabase.from('tenants').select('*').eq('tenant_id', tenantId).single();
+    
+    if (!tenant) {
+        tenant = {
+            tenant_id: tenantId,
             status: 'disconnected',
             qr: null,
             number: '',
-            messages: [],
+            is_initializing: false,
             rules: [
                 { id: 1, keyword: 'done', severity: 'success', active: true },
                 { id: 2, keyword: 'delay', severity: 'warning', active: true },
                 { id: 3, keyword: 'issue', severity: 'danger', active: true }
-            ],
-            isInitializing: false
-        }
+            ]
+        };
+        await supabase.from('tenants').insert([tenant]);
     }
-    return tenants[tenantId];
+    return tenant;
 }
 
-// Middleware to extract tenant ID
-app.use((req, res, next) => {
-    // If no tenant ID is provided, use a default fallback (so old endpoints don't instantly break)
+// Middleware to extract tenant ID and fetch data from Supabase
+app.use(async (req, res, next) => {
     req.tenantId = req.headers['x-tenant-id'] || 'default_tenant';
-    req.tenantData = getTenant(req.tenantId);
-    next();
+    try {
+        req.tenantData = await getTenant(req.tenantId);
+        next();
+    } catch (err) {
+        console.error('Error fetching tenant:', err);
+        res.status(500).json({ error: 'Failed to fetch tenant data' });
+    }
 });
 
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
   // Lazily initialize the WhatsApp client for this tenant if not already started
-  if (!req.tenantData.isInitializing && req.tenantData.status === 'disconnected') {
-      req.tenantData.isInitializing = true;
-      initializeWhatsApp(req.tenantId, req.tenantData, classifyLocally);
+  if (!req.tenantData.is_initializing && req.tenantData.status === 'disconnected') {
+      await supabase.from('tenants').update({ is_initializing: true }).eq('tenant_id', req.tenantId);
+      initializeWhatsApp(req.tenantId, classifyLocally);
   }
 
   res.json({
@@ -64,38 +76,63 @@ app.get('/api/status', (req, res) => {
   })
 })
 
-app.get('/api/messages', (req, res) => {
-  res.json(req.tenantData.messages)
+app.get('/api/messages', async (req, res) => {
+  const { data: messages } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('tenant_id', req.tenantId)
+    .order('created_at', { ascending: false })
+    .limit(100);
+    
+  const formatted = (messages || []).map(m => ({
+      id: m.id,
+      sender: m.sender,
+      group: m.group_name,
+      message: m.message,
+      time: m.time,
+      severity: m.severity,
+      aiLabel: m.ai_label,
+      confidence: m.confidence
+  }));
+  res.json(formatted);
 })
 
 app.get('/api/rules', (req, res) => {
-  res.json(req.tenantData.rules)
+  res.json(req.tenantData.rules || []);
 })
 
-app.post('/api/rules', (req, res) => {
-  req.tenantData.rules = req.body.rules
-  res.json({ success: true, message: 'Rules saved' })
+app.post('/api/rules', async (req, res) => {
+  await supabase.from('tenants').update({ rules: req.body.rules }).eq('tenant_id', req.tenantId);
+  res.json({ success: true, message: 'Rules saved to Supabase' })
 })
 
-app.post('/api/simulate', (req, res) => {
+app.post('/api/simulate', async (req, res) => {
   const { text } = req.body;
   const classification = classifyLocally(text, req.tenantData.rules);
   
   const newMsg = {
       id: Date.now().toString(),
+      tenant_id: req.tenantId,
       sender: 'Simulation Tool',
-      group: 'Test Group',
+      group_name: 'Test Group',
       message: text,
       time: new Date().toLocaleTimeString(),
       severity: classification.severity,
-      aiLabel: classification.label,
+      ai_label: classification.label,
       confidence: classification.confidence
   };
   
-  req.tenantData.messages.unshift(newMsg);
+  await supabase.from('messages').insert([newMsg]);
   res.json(newMsg);
 })
 
-app.listen(port, () => {
-  console.log(`Multi-Tenant Server running on port ${port}`)
-})
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://arul:<db_password>@revotra.6vsus04.mongodb.net/?appName=Revotra";
+
+mongoose.connect(MONGODB_URI).then(() => {
+  console.log('Connected to MongoDB for Session Storage!');
+  app.listen(port, () => {
+    console.log(`Multi-Tenant Server running on port ${port}`)
+  });
+}).catch(err => {
+  console.error('MongoDB connection error:', err);
+});
