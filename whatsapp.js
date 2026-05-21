@@ -6,6 +6,7 @@ function initializeWhatsApp(dataStore, classifyFn) {
     const client = new Client({
         authStrategy: new LocalAuth(),
         puppeteer: {
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
