@@ -2,6 +2,7 @@ const { Client, RemoteAuth } = require('whatsapp-web.js');
 const { MongoStore } = require('wwebjs-mongo');
 const mongoose = require('mongoose');
 const { createClient } = require('@supabase/supabase-js');
+global.WebSocket = require('ws');
 
 // Initialize Supabase Client
 const supabaseUrl = process.env.SUPABASE_URL;

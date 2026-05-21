@@ -3,6 +3,7 @@ const express = require('express')
 const cors = require('cors')
 const mongoose = require('mongoose')
 const { createClient } = require('@supabase/supabase-js');
+global.WebSocket = require('ws');
 const { initializeWhatsApp } = require('./whatsapp')
 
 const app = express()
