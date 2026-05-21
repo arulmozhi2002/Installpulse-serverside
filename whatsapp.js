@@ -30,7 +30,6 @@ function initializeWhatsApp(tenantId, classifyFn) {
                 '--no-first-run',
                 '--no-zygote',
                 '--disable-gpu',
-                '--single-process',
                 '--memory-pressure-off'
             ]
         }
