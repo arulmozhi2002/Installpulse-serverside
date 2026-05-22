@@ -104,7 +104,7 @@ async function getCachedDp(sock, jid) {
 async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, onDisconnected) {
     console.log(`[${tenantId}] Initializing WhatsApp client...`)
 
-    const { default: makeWASocket, DisconnectReason } = await baileys()
+    const { default: makeWASocket, DisconnectReason, Browsers, fetchLatestBaileysVersion } = await baileys()
 
     let state, saveCreds
     try {
@@ -115,12 +115,25 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
         return
     }
 
+    // Fetch current WA Web version — old versions get a 405 rejection
+    let version = [2, 3000, 1023473728]
+    try {
+        const result = await Promise.race([
+            fetchLatestBaileysVersion(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000))
+        ])
+        version = result.version
+        console.log(`[${tenantId}] WA version:`, version.join('.'))
+    } catch {
+        console.log(`[${tenantId}] Using fallback WA version`)
+    }
+
     const sock = makeWASocket({
-        version: [2, 3000, 1023473728],
+        version,
         auth: state,
         logger,
         printQRInTerminal: false,
-        browser: ['InstallPulse', 'Chrome', '1.0.0'],
+        browser: Browsers.ubuntu('Chrome'),
         getMessage: async () => undefined,
         syncFullHistory: false,
         markOnlineOnConnect: false,
