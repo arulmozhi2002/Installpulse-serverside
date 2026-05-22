@@ -2,8 +2,6 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const mongoose = require('mongoose')
-const { createClient } = require('@supabase/supabase-js');
-global.WebSocket = require('ws');
 const { initializeWhatsApp } = require('./whatsapp')
 
 const app = express()
@@ -12,10 +10,37 @@ const port = process.env.PORT || 3000
 app.use(cors())
 app.use(express.json())
 
-// Initialize Supabase Client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Define MongoDB Schemas
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception (ignoring to keep server alive):', err);
+});
+
+const tenantSchema = new mongoose.Schema({
+    tenant_id: { type: String, required: true, unique: true },
+    status: { type: String, default: 'disconnected' },
+    qr: { type: String, default: null },
+    number: { type: String, default: '' },
+    rules: { type: Array, default: [
+        { id: 1, keyword: 'done', severity: 'success', active: true },
+        { id: 2, keyword: 'delay', severity: 'warning', active: true },
+        { id: 3, keyword: 'issue', severity: 'danger', active: true }
+    ] }
+});
+const Tenant = mongoose.model('Tenant', tenantSchema);
+
+const messageSchema = new mongoose.Schema({
+    id: { type: String, unique: true },
+    tenant_id: String,
+    sender: String,
+    sender_dp: String,
+    group_name: String,
+    message: String,
+    time: String,
+    severity: String,
+    ai_label: String,
+    confidence: Number
+}, { timestamps: true });
+const Message = mongoose.model('Message', messageSchema);
 
 // Helper to classify locally using custom rules
 const classifyLocally = (text, rules) => {
@@ -29,29 +54,17 @@ const classifyLocally = (text, rules) => {
   return { severity: 'warning', label: 'Unclassified', confidence: 0 };
 }
 
-// Get or create tenant in Supabase
+// Get or create tenant in MongoDB
 async function getTenant(tenantId) {
-    let { data: tenant, error } = await supabase.from('tenants').select('*').eq('tenant_id', tenantId).single();
-    
+    let tenant = await Tenant.findOne({ tenant_id: tenantId });
     if (!tenant) {
-        tenant = {
-            tenant_id: tenantId,
-            status: 'disconnected',
-            qr: null,
-            number: '',
-            is_initializing: false,
-            rules: [
-                { id: 1, keyword: 'done', severity: 'success', active: true },
-                { id: 2, keyword: 'delay', severity: 'warning', active: true },
-                { id: 3, keyword: 'issue', severity: 'danger', active: true }
-            ]
-        };
-        await supabase.from('tenants').insert([tenant]);
+        tenant = new Tenant({ tenant_id: tenantId });
+        await tenant.save();
     }
     return tenant;
 }
 
-// Middleware to extract tenant ID and fetch data from Supabase
+// Middleware to extract tenant ID and fetch data
 app.use(async (req, res, next) => {
     req.tenantId = req.headers['x-tenant-id'] || 'default_tenant';
     try {
@@ -63,11 +76,21 @@ app.use(async (req, res, next) => {
     }
 });
 
+const initializingTenants = new Set();
+
 app.get('/api/status', async (req, res) => {
   // Lazily initialize the WhatsApp client for this tenant if not already started
-  if (!req.tenantData.is_initializing && req.tenantData.status === 'disconnected') {
-      await supabase.from('tenants').update({ is_initializing: true }).eq('tenant_id', req.tenantId);
-      initializeWhatsApp(req.tenantId, classifyLocally);
+  if (!initializingTenants.has(req.tenantId) && (req.tenantData.status === 'disconnected' || req.tenantData.status === 'authenticating')) {
+      console.log(`Calling initializeWhatsApp for ${req.tenantId}`);
+      initializingTenants.add(req.tenantId);
+      initializeWhatsApp(req.tenantId, classifyLocally, 
+          // onInitError
+          () => { initializingTenants.delete(req.tenantId); },
+          // onReady
+          () => { initializingTenants.delete(req.tenantId); },
+          // onDisconnected
+          () => { initializingTenants.delete(req.tenantId); }
+      );
   }
 
   res.json({
@@ -78,16 +101,14 @@ app.get('/api/status', async (req, res) => {
 })
 
 app.get('/api/messages', async (req, res) => {
-  const { data: messages } = await supabase
-    .from('messages')
-    .select('*')
-    .eq('tenant_id', req.tenantId)
-    .order('created_at', { ascending: false })
-    .limit(100);
-    
-  const formatted = (messages || []).map(m => ({
+  const messages = await Message.find({ tenant_id: req.tenantId })
+                                .sort({ createdAt: -1 })
+                                .limit(100);
+                                
+  const formatted = messages.map(m => ({
       id: m.id,
       sender: m.sender,
+      senderDp: m.sender_dp,
       group: m.group_name,
       message: m.message,
       time: m.time,
@@ -103,15 +124,15 @@ app.get('/api/rules', (req, res) => {
 })
 
 app.post('/api/rules', async (req, res) => {
-  await supabase.from('tenants').update({ rules: req.body.rules }).eq('tenant_id', req.tenantId);
-  res.json({ success: true, message: 'Rules saved to Supabase' })
+  await Tenant.updateOne({ tenant_id: req.tenantId }, { rules: req.body.rules });
+  res.json({ success: true, message: 'Rules saved to MongoDB' })
 })
 
 app.post('/api/simulate', async (req, res) => {
   const { text } = req.body;
   const classification = classifyLocally(text, req.tenantData.rules);
   
-  const newMsg = {
+  const newMsg = new Message({
       id: Date.now().toString(),
       tenant_id: req.tenantId,
       sender: 'Simulation Tool',
@@ -121,19 +142,43 @@ app.post('/api/simulate', async (req, res) => {
       severity: classification.severity,
       ai_label: classification.label,
       confidence: classification.confidence
-  };
+  });
   
-  await supabase.from('messages').insert([newMsg]);
+  await newMsg.save();
   res.json(newMsg);
 })
 
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://arul:<db_password>@revotra.6vsus04.mongodb.net/?appName=Revotra";
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/whatsapp_sessions";
 
-mongoose.connect(MONGODB_URI).then(() => {
-  console.log('Connected to MongoDB for Session Storage!');
-  app.listen(port, () => {
+mongoose.connect(MONGODB_URI).then(async () => {
+  console.log('Connected to MongoDB for Session and Data Storage!');
+  
+  // Set previously connected tenants to authenticating so the frontend doesn't flash the QR code generator on server restart.
+  await Tenant.updateMany({ status: 'connected' }, { status: 'authenticating', qr: null });
+  // Ensure we clear QR codes for disconnected tenants as well just in case they were left lingering
+  await Tenant.updateMany({ status: 'disconnected' }, { qr: null });
+  
+  console.log('Reset tenant statuses for seamless re-initialization.');
+
+  const server = app.listen(port, () => {
     console.log(`Multi-Tenant Server running on port ${port}`)
   });
+  
+  const { destroyAllClients } = require('./whatsapp');
+  
+  const gracefulShutdown = async () => {
+      console.log('Shutting down server, destroying WhatsApp clients...');
+      await destroyAllClients();
+      server.close(() => {
+          mongoose.connection.close(false, () => {
+              process.exit(0);
+          });
+      });
+  };
+  
+  process.on('SIGINT', gracefulShutdown);
+  process.on('SIGTERM', gracefulShutdown);
 }).catch(err => {
   console.error('MongoDB connection error:', err);
 });
+
