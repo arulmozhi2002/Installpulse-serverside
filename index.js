@@ -96,7 +96,7 @@ app.use(async (req, res, next) => {
 // ── Initialization tracker ───────────────────────────────────────────────────
 
 const initializingTenants = new Map(); // tenantId → startTime
-const INIT_TIMEOUT_MS = 120_000;       // 2 minutes before we assume Chrome is stuck
+const INIT_TIMEOUT_MS = 180_000;       // 3 minutes — Chrome auth can be slow on Render
 
 function needsInit(tenantId, status) {
     if (status !== 'disconnected' && status !== 'authenticating') return false;
@@ -105,8 +105,8 @@ function needsInit(tenantId, status) {
     if (elapsed > INIT_TIMEOUT_MS) {
         console.log(`[${tenantId}] Init timed out (${elapsed}ms) — retrying`);
         initializingTenants.delete(tenantId);
-        destroyClient(tenantId);
-        return true;
+        destroyClient(tenantId).then(() => startInit(tenantId));
+        return false; // startInit called async above; don't let caller call it again
     }
     return false;
 }
@@ -135,7 +135,7 @@ app.get('/api/status', async (req, res) => {
 
         if (needsInit(req.tenantId, tenant.status)) {
             console.log(`Starting init for ${req.tenantId}`);
-            startInit(req.tenantId);
+            startInit(req.tenantId); // only reached on first init; timeout-retry is handled inside needsInit
         }
 
         res.json({ status: tenant.status, qr: tenant.qr, number: tenant.number || '' });

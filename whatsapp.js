@@ -39,7 +39,6 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--single-process',
                 '--disable-gpu',
                 '--disable-extensions',
                 '--disable-software-rasterizer',
@@ -48,6 +47,8 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding',
                 '--disable-features=site-per-process,TranslateUI,BlinkGenPropertyTrees',
+                '--renderer-process-limit=1',
+                '--js-flags=--max-old-space-size=128',
                 '--mute-audio'
             ]
         }
