@@ -1,7 +1,6 @@
 const {
     default: makeWASocket,
     DisconnectReason,
-    fetchLatestBaileysVersion,
     initAuthCreds,
     BufferJSON,
 } = require('@whiskeysockets/baileys')
@@ -113,8 +112,8 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
         return
     }
 
-    const { version } = await fetchLatestBaileysVersion()
-        .catch(() => ({ version: [2, 3000, 1023473728] }))
+    // Use bundled version — skips slow GitHub HTTP call on every init
+    const { version } = require('@whiskeysockets/baileys/baileys-version.json')
 
     const sock = makeWASocket({
         version,
