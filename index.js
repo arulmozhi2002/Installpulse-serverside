@@ -2,7 +2,7 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const mongoose = require('mongoose')
-const { initializeWhatsApp, destroyClient, destroyAllClients } = require('./whatsapp')
+const { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode } = require('./whatsapp')
 
 const app = express()
 const port = process.env.PORT || 3000
@@ -142,6 +142,19 @@ app.get('/api/status', async (req, res) => {
     } catch (err) {
         console.error('Error in /api/status:', err);
         res.status(500).json({ error: 'Failed to fetch status' });
+    }
+});
+
+// Request a pairing code for phone-number-based login (no QR scan needed)
+app.post('/api/pair', async (req, res) => {
+    const { phoneNumber } = req.body;
+    if (!phoneNumber) return res.status(400).json({ error: 'phoneNumber required' });
+    try {
+        const code = await requestPairingCode(req.tenantId, phoneNumber);
+        res.json({ code });
+    } catch (err) {
+        console.error('Error in /api/pair:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 

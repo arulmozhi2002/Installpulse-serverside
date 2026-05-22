@@ -8,6 +8,7 @@ const { Boom } = require('@hapi/boom')
 const mongoose = require('mongoose')
 
 const activeClients = new Map()
+const sockQrReady = new Map() // tenantId → true once first QR fires (socket ready for pairing)
 
 // ── Silent logger (Baileys is very chatty by default) ─────────────────────
 const logger = {
@@ -129,6 +130,7 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
     })
 
     activeClients.set(tenantId, sock)
+    sockQrReady.set(tenantId, false)
     sock.ev.on('creds.update', saveCreds)
 
     let qrSeen = false
@@ -138,6 +140,7 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
 
         if (qr) {
             qrSeen = true
+            sockQrReady.set(tenantId, true)  // socket is ready — pairing code can now be requested
             console.log(`[${tenantId}] QR received`)
             await mongoose.model('Tenant').updateOne(
                 { tenant_id: tenantId },
@@ -175,6 +178,7 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
             ).catch(() => {})
 
             activeClients.delete(tenantId)
+            sockQrReady.delete(tenantId)
 
             if (loggedOut) {
                 // Wipe saved session so the next init shows a fresh QR
@@ -246,6 +250,15 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
     })
 }
 
+async function requestPairingCode(tenantId, phoneNumber) {
+    const sock = activeClients.get(tenantId)
+    if (!sock) throw new Error('Client not initialised yet — wait for the QR screen to appear first')
+    if (!sockQrReady.get(tenantId)) throw new Error('Socket not ready — wait a few seconds and try again')
+    const digits = phoneNumber.replace(/\D/g, '')
+    const code = await sock.requestPairingCode(digits)
+    return code
+}
+
 async function destroyClient(tenantId) {
     const sock = activeClients.get(tenantId)
     if (sock) {
@@ -266,4 +279,4 @@ async function destroyAllClients() {
     activeClients.clear()
 }
 
-module.exports = { initializeWhatsApp, destroyClient, destroyAllClients }
+module.exports = { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode }
