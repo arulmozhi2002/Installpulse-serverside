@@ -26,7 +26,15 @@ function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, onDiscon
                 '--no-first-run',
                 '--no-zygote',
                 '--disable-gpu',
-                '--memory-pressure-off'
+                '--single-process',
+                '--disable-extensions',
+                '--disable-software-rasterizer',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--mute-audio',
+                '--js-flags="--max-old-space-size=256"'
             ]
         }
     });
