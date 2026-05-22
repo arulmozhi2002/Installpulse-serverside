@@ -1,19 +1,14 @@
-const { Client, RemoteAuth } = require('whatsapp-web.js');
-const { MongoStore } = require('wwebjs-mongo');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const mongoose = require('mongoose');
 
 const activeClients = new Map();
 
 function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, onDisconnected) {
     console.log(`Initializing WhatsApp Client for Tenant: ${tenantId}...`);
-    
-    const store = new MongoStore({ mongoose: mongoose });
 
     const client = new Client({
-        authStrategy: new RemoteAuth({ 
+        authStrategy: new LocalAuth({ 
             clientId: tenantId,
-            store: store,
-            backupSyncIntervalMs: 300000,
             dataPath: './.wwebjs_auth'
         }),
         puppeteer: {
@@ -39,9 +34,7 @@ function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, onDiscon
         }
     });
 
-    client.on('remote_session_saved', () => {
-        console.log(`[${tenantId}] Remote Session explicitly saved to MongoDB.`);
-    });
+
 
     client.on('qr', async qr => {
         console.log(`[${tenantId}] QR Code Received`);
