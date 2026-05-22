@@ -1,16 +1,17 @@
-const {
-    default: makeWASocket,
-    DisconnectReason,
-    initAuthCreds,
-    BufferJSON,
-} = require('@whiskeysockets/baileys')
 const { Boom } = require('@hapi/boom')
 const mongoose = require('mongoose')
 
-const activeClients = new Map()
-const sockQrReady = new Map() // tenantId → true once first QR fires (socket ready for pairing)
+// Baileys is ESM-only — use dynamic import and cache the module
+let _baileys = null
+async function baileys() {
+    if (!_baileys) _baileys = await import('@whiskeysockets/baileys')
+    return _baileys
+}
 
-// ── Silent logger (Baileys is very chatty by default) ─────────────────────
+const activeClients = new Map()
+const sockQrReady = new Map()
+
+// ── Silent logger ─────────────────────────────────────────────────────────
 const logger = {
     level: 'silent',
     trace: () => {}, debug: () => {}, info: () => {},
@@ -18,7 +19,7 @@ const logger = {
     child: function () { return this },
 }
 
-// ── MongoDB auth state (persists session across Render restarts) ──────────
+// ── MongoDB auth state ────────────────────────────────────────────────────
 
 const authSchema = new mongoose.Schema({
     tenant_id: { type: String, required: true, unique: true },
@@ -34,10 +35,9 @@ function getAuthModel() {
 }
 
 async function useMongoAuthState(tenantId) {
+    const { initAuthCreds, BufferJSON } = await baileys()
     const Model = getAuthModel()
 
-    // Load once into memory — Baileys calls keys.get() hundreds of times per
-    // connection; hitting MongoDB on every call causes OOM from query objects.
     const doc = await Model.findOne({ tenant_id: tenantId })
     let cached = { creds: initAuthCreds(), keys: {} }
     if (doc?.data && doc.data !== '{}') {
@@ -104,6 +104,8 @@ async function getCachedDp(sock, jid) {
 async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, onDisconnected) {
     console.log(`[${tenantId}] Initializing WhatsApp client...`)
 
+    const { default: makeWASocket, DisconnectReason } = await baileys()
+
     let state, saveCreds
     try {
         ;({ state, saveCreds } = await useMongoAuthState(tenantId))
@@ -113,11 +115,8 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
         return
     }
 
-    // Use bundled version — skips slow GitHub HTTP call on every init
-    const { version } = require('@whiskeysockets/baileys/baileys-version.json')
-
     const sock = makeWASocket({
-        version,
+        version: [2, 3000, 1023473728],
         auth: state,
         logger,
         printQRInTerminal: false,
@@ -140,7 +139,7 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
 
         if (qr) {
             qrSeen = true
-            sockQrReady.set(tenantId, true)  // socket is ready — pairing code can now be requested
+            sockQrReady.set(tenantId, true)
             console.log(`[${tenantId}] QR received`)
             await mongoose.model('Tenant').updateOne(
                 { tenant_id: tenantId },
@@ -169,7 +168,6 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
         if (connection === 'close') {
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
             const loggedOut = statusCode === DisconnectReason.loggedOut
-
             console.log(`[${tenantId}] Disconnected, code:`, statusCode)
 
             await mongoose.model('Tenant').updateOne(
@@ -181,7 +179,6 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
             sockQrReady.delete(tenantId)
 
             if (loggedOut) {
-                // Wipe saved session so the next init shows a fresh QR
                 await getAuthModel().deleteOne({ tenant_id: tenantId }).catch(() => {})
             }
 
@@ -227,7 +224,6 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
 
             const dpUrl = await getCachedDp(sock, senderJid)
             const cls = classifyFn(body, rules)
-
             console.log(`[${tenantId}] Message from ${senderName}:`, body)
 
             try {
@@ -252,8 +248,8 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
 
 async function requestPairingCode(tenantId, phoneNumber) {
     const sock = activeClients.get(tenantId)
-    if (!sock) throw new Error('Client not initialised yet — wait for the QR screen to appear first')
-    if (!sockQrReady.get(tenantId)) throw new Error('Socket not ready — wait a few seconds and try again')
+    if (!sock) throw new Error('Client not initialised yet — wait a few seconds and try again')
+    if (!sockQrReady.get(tenantId)) throw new Error('Socket not ready yet — wait a few seconds and try again')
     const digits = phoneNumber.replace(/\D/g, '')
     const code = await sock.requestPairingCode(digits)
     return code
@@ -263,6 +259,7 @@ async function destroyClient(tenantId) {
     const sock = activeClients.get(tenantId)
     if (sock) {
         activeClients.delete(tenantId)
+        sockQrReady.delete(tenantId)
         sock.ev.removeAllListeners()
         try { sock.end() } catch {}
     }
