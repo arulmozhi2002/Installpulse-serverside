@@ -40,6 +40,7 @@ const messageSchema = new mongoose.Schema({
     ai_label: String,
     confidence: Number
 }, { timestamps: true });
+messageSchema.index({ tenant_id: 1, createdAt: -1 });
 const Message = mongoose.model('Message', messageSchema);
 
 // Helper to classify locally using custom rules
@@ -54,13 +55,18 @@ const classifyLocally = (text, rules) => {
   return { severity: 'warning', label: 'Unclassified', confidence: 0 };
 }
 
-// Get or create tenant in MongoDB
+// Short-lived cache to avoid hitting MongoDB on every poll request
+const tenantCache = new Map();
 async function getTenant(tenantId) {
+    const cached = tenantCache.get(tenantId);
+    if (cached && Date.now() - cached.ts < 4000) return cached.tenant;
+
     let tenant = await Tenant.findOne({ tenant_id: tenantId });
     if (!tenant) {
         tenant = new Tenant({ tenant_id: tenantId });
         await tenant.save();
     }
+    tenantCache.set(tenantId, { tenant, ts: Date.now() });
     return tenant;
 }
 
@@ -79,24 +85,25 @@ app.use(async (req, res, next) => {
 const initializingTenants = new Set();
 
 app.get('/api/status', async (req, res) => {
+  // Always read fresh from DB so QR appears immediately after it's generated
+  const tenant = await Tenant.findOne({ tenant_id: req.tenantId });
+  if (!tenant) return res.json({ status: 'disconnected', qr: null, number: '' });
+
   // Lazily initialize the WhatsApp client for this tenant if not already started
-  if (!initializingTenants.has(req.tenantId) && (req.tenantData.status === 'disconnected' || req.tenantData.status === 'authenticating')) {
+  if (!initializingTenants.has(req.tenantId) && (tenant.status === 'disconnected' || tenant.status === 'authenticating')) {
       console.log(`Calling initializeWhatsApp for ${req.tenantId}`);
       initializingTenants.add(req.tenantId);
-      initializeWhatsApp(req.tenantId, classifyLocally, 
-          // onInitError
+      initializeWhatsApp(req.tenantId, classifyLocally,
           () => { initializingTenants.delete(req.tenantId); },
-          // onReady
           () => { initializingTenants.delete(req.tenantId); },
-          // onDisconnected
           () => { initializingTenants.delete(req.tenantId); }
       );
   }
 
   res.json({
-    status: req.tenantData.status,
-    qr: req.tenantData.qr,
-    number: req.tenantData.number || ''
+    status: tenant.status,
+    qr: tenant.qr,
+    number: tenant.number || ''
   })
 })
 
