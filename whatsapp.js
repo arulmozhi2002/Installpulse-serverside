@@ -4,6 +4,19 @@ const mongoose = require('mongoose');
 
 const activeClients = new Map();
 
+// Cache profile pic URLs per contact to avoid redundant network calls
+const dpCache = new Map(); // key: contactId → { url, ts }
+const DP_TTL = 10 * 60 * 1000; // 10 minutes
+
+async function getCachedDp(contact) {
+    const key = contact.id._serialized;
+    const hit = dpCache.get(key);
+    if (hit && Date.now() - hit.ts < DP_TTL) return hit.url;
+    const url = await contact.getProfilePicUrl().catch(() => null);
+    dpCache.set(key, { url, ts: Date.now() });
+    return url;
+}
+
 async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, onDisconnected) {
     console.log(`[${tenantId}] Initializing WhatsApp client...`);
 
@@ -14,7 +27,7 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
         authStrategy: new RemoteAuth({
             clientId: tenantId,
             store,
-            backupSyncIntervalMs: 60000
+            backupSyncIntervalMs: 300000
         }),
         puppeteer: {
             headless: true,
@@ -26,6 +39,7 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
+                '--single-process',
                 '--disable-gpu',
                 '--disable-extensions',
                 '--disable-software-rasterizer',
@@ -33,6 +47,7 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
                 '--disable-background-timer-throttling',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding',
+                '--disable-features=site-per-process,TranslateUI,BlinkGenPropertyTrees',
                 '--mute-audio'
             ]
         }
@@ -98,8 +113,8 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
             const tenant = await mongoose.model('Tenant').findOne({ tenant_id: tenantId });
             const rules = tenant?.rules || [];
 
-            for (const chat of chats.slice(0, 10)) {
-                const msgs = await chat.fetchMessages({ limit: 15 });
+            for (const chat of chats.slice(0, 5)) {
+                const msgs = await chat.fetchMessages({ limit: 10 });
                 for (const msg of msgs) {
                     if (msg.fromMe) continue;
                     if (msg.from === 'status@broadcast' || msg.to === 'status@broadcast') continue;
@@ -107,15 +122,14 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
                     if (!exists) {
                         const contact = await msg.getContact();
                         const senderName = contact.name || contact.pushname || msg._data?.notifyName || msg.from.split('@')[0];
-                        const dpUrl = await contact.getProfilePicUrl().catch(() => null);
-                        // For DMs use the contact's name; for groups use the group name
+                        // Skip profile pic fetch during startup sync to reduce memory/network load
                         const groupName = msg.from.includes('@g.us') ? chat.name : senderName;
                         const cls = classifyFn(msg.body || '', rules);
                         await new MessageModel({
                             id: msg.id._serialized,
                             tenant_id: tenantId,
                             sender: senderName,
-                            sender_dp: dpUrl,
+                            sender_dp: null,
                             group_name: groupName,
                             message: msg.body || '',
                             time: new Date(msg.timestamp * 1000).toLocaleTimeString(),
@@ -144,7 +158,7 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
 
         const contact = await msg.getContact();
         const senderName = contact.name || contact.pushname || msg._data?.notifyName || msg.from.split('@')[0];
-        const dpUrl = await contact.getProfilePicUrl().catch(() => null);
+        const dpUrl = await getCachedDp(contact);
         const chat = await msg.getChat();
         // For DMs use the contact's name; for groups use the group name
         const groupName = msg.from.includes('@g.us') ? chat.name : senderName;
