@@ -96,7 +96,7 @@ app.use(async (req, res, next) => {
 // ── Initialization tracker ───────────────────────────────────────────────────
 
 const initializingTenants = new Map(); // tenantId → startTime
-const INIT_TIMEOUT_MS = 180_000;       // 3 minutes — Chrome auth can be slow on Render
+const INIT_TIMEOUT_MS = 60_000;        // 60s — Baileys connects in seconds, not minutes
 
 function needsInit(tenantId, status) {
     if (status !== 'disconnected' && status !== 'authenticating') return false;
@@ -106,7 +106,7 @@ function needsInit(tenantId, status) {
         console.log(`[${tenantId}] Init timed out (${elapsed}ms) — retrying`);
         initializingTenants.delete(tenantId);
         destroyClient(tenantId).then(() => startInit(tenantId));
-        return false; // startInit called async above; don't let caller call it again
+        return false;
     }
     return false;
 }
