@@ -10,8 +10,12 @@ const port = process.env.PORT || 3000
 app.use(cors())
 app.use(express.json())
 
+// Keep server alive on unexpected errors; log for debugging
 process.on('uncaughtException', (err) => {
     console.error('Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled Rejection:', reason);
 });
 
 // ── Schemas ─────────────────────────────────────────────────────────────────
@@ -30,24 +34,29 @@ const tenantSchema = new mongoose.Schema({
 const Tenant = mongoose.model('Tenant', tenantSchema);
 
 const messageSchema = new mongoose.Schema({
-    id:        { type: String, unique: true },
-    tenant_id: String,
-    sender:    String,
-    sender_dp: String,
+    id:         { type: String, unique: true },
+    tenant_id:  String,
+    sender:     String,
+    sender_dp:  String,
     group_name: String,
-    message:   String,
-    time:      String,
-    severity:  String,
-    ai_label:  String,
+    message:    String,
+    time:       String,
+    severity:   String,
+    ai_label:   String,
     confidence: Number
 }, { timestamps: true });
+
+// Fast lookup when fetching messages
 messageSchema.index({ tenant_id: 1, createdAt: -1 });
+// Auto-delete messages older than 30 days to stay within 512 MB Atlas limit
+messageSchema.index({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
+
 const Message = mongoose.model('Message', messageSchema);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const classifyLocally = (text, rules) => {
-    if (!rules) return { severity: 'warning', label: 'Unclassified', confidence: 0 };
+    if (!rules || !text) return { severity: 'warning', label: 'Unclassified', confidence: 0 };
     const lower = text.toLowerCase();
     for (const rule of rules) {
         if (rule.active && lower.includes(rule.keyword.toLowerCase())) {
@@ -86,17 +95,15 @@ app.use(async (req, res, next) => {
 
 // ── Initialization tracker ───────────────────────────────────────────────────
 
-// Maps tenantId → Date.now() when init started, so we can detect stuck inits
-const initializingTenants = new Map();
-const INIT_TIMEOUT_MS = 120_000; // 2 minutes
+const initializingTenants = new Map(); // tenantId → startTime
+const INIT_TIMEOUT_MS = 120_000;       // 2 minutes before we assume Chrome is stuck
 
 function needsInit(tenantId, status) {
     if (status !== 'disconnected' && status !== 'authenticating') return false;
     if (!initializingTenants.has(tenantId)) return true;
-    // Allow retry if stuck for too long (Chrome crash without events)
     const elapsed = Date.now() - initializingTenants.get(tenantId);
     if (elapsed > INIT_TIMEOUT_MS) {
-        console.log(`[${tenantId}] Init timed out after ${elapsed}ms — retrying`);
+        console.log(`[${tenantId}] Init timed out (${elapsed}ms) — retrying`);
         initializingTenants.delete(tenantId);
         destroyClient(tenantId);
         return true;
@@ -117,46 +124,64 @@ function startInit(tenantId) {
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
-// Always reads fresh from DB so the QR appears immediately after it is generated
+// Render health check — must respond 200 or Render marks service as down
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Always reads fresh from DB so QR appears immediately after generation
 app.get('/api/status', async (req, res) => {
-    const tenant = await Tenant.findOne({ tenant_id: req.tenantId });
-    if (!tenant) return res.json({ status: 'disconnected', qr: null, number: '' });
+    try {
+        const tenant = await Tenant.findOne({ tenant_id: req.tenantId });
+        if (!tenant) return res.json({ status: 'disconnected', qr: null, number: '' });
 
-    if (needsInit(req.tenantId, tenant.status)) {
-        console.log(`Starting init for ${req.tenantId}`);
-        startInit(req.tenantId);
+        if (needsInit(req.tenantId, tenant.status)) {
+            console.log(`Starting init for ${req.tenantId}`);
+            startInit(req.tenantId);
+        }
+
+        res.json({ status: tenant.status, qr: tenant.qr, number: tenant.number || '' });
+    } catch (err) {
+        console.error('Error in /api/status:', err);
+        res.status(500).json({ error: 'Failed to fetch status' });
     }
-
-    res.json({ status: tenant.status, qr: tenant.qr, number: tenant.number || '' });
 });
 
 // Force logout + destroy session → triggers fresh QR on next status poll
 app.post('/api/logout', async (req, res) => {
-    await destroyClient(req.tenantId);
-    initializingTenants.delete(req.tenantId);
-    await Tenant.updateOne(
-        { tenant_id: req.tenantId },
-        { status: 'disconnected', qr: null, number: '' }
-    );
-    tenantCache.delete(req.tenantId);
-    res.json({ success: true });
+    try {
+        await destroyClient(req.tenantId);
+        initializingTenants.delete(req.tenantId);
+        await Tenant.updateOne(
+            { tenant_id: req.tenantId },
+            { status: 'disconnected', qr: null, number: '' }
+        );
+        tenantCache.delete(req.tenantId);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error in /api/logout:', err);
+        res.status(500).json({ error: 'Failed to logout' });
+    }
 });
 
 app.get('/api/messages', async (req, res) => {
-    const messages = await Message.find({ tenant_id: req.tenantId })
-        .sort({ createdAt: -1 })
-        .limit(100);
-    res.json(messages.map(m => ({
-        id:         m.id,
-        sender:     m.sender,
-        senderDp:   m.sender_dp,
-        group:      m.group_name,
-        message:    m.message,
-        time:       m.time,
-        severity:   m.severity,
-        aiLabel:    m.ai_label,
-        confidence: m.confidence
-    })));
+    try {
+        const messages = await Message.find({ tenant_id: req.tenantId })
+            .sort({ createdAt: -1 })
+            .limit(100);
+        res.json(messages.map(m => ({
+            id:         m.id,
+            sender:     m.sender,
+            senderDp:   m.sender_dp,
+            group:      m.group_name,
+            message:    m.message,
+            time:       m.time,
+            severity:   m.severity,
+            aiLabel:    m.ai_label,
+            confidence: m.confidence
+        })));
+    } catch (err) {
+        console.error('Error in /api/messages:', err);
+        res.status(500).json({ error: 'Failed to fetch messages' });
+    }
 });
 
 app.get('/api/rules', (req, res) => {
@@ -164,38 +189,49 @@ app.get('/api/rules', (req, res) => {
 });
 
 app.post('/api/rules', async (req, res) => {
-    await Tenant.updateOne({ tenant_id: req.tenantId }, { rules: req.body.rules });
-    tenantCache.delete(req.tenantId);
-    res.json({ success: true });
+    try {
+        await Tenant.updateOne({ tenant_id: req.tenantId }, { rules: req.body.rules });
+        tenantCache.delete(req.tenantId);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error in /api/rules:', err);
+        res.status(500).json({ error: 'Failed to save rules' });
+    }
 });
 
 app.post('/api/simulate', async (req, res) => {
-    const { text } = req.body;
-    const cls = classifyLocally(text, req.tenantData.rules);
-    const msg = new Message({
-        id:         Date.now().toString(),
-        tenant_id:  req.tenantId,
-        sender:     'Simulation Tool',
-        group_name: 'Test Group',
-        message:    text,
-        time:       new Date().toLocaleTimeString(),
-        severity:   cls.severity,
-        ai_label:   cls.label,
-        confidence: cls.confidence
-    });
-    await msg.save();
-    res.json(msg);
+    try {
+        const { text } = req.body;
+        if (!text) return res.status(400).json({ error: 'text is required' });
+        const cls = classifyLocally(text, req.tenantData.rules);
+        const msg = new Message({
+            id:         Date.now().toString(),
+            tenant_id:  req.tenantId,
+            sender:     'Simulation Tool',
+            group_name: 'Test Group',
+            message:    text,
+            time:       new Date().toLocaleTimeString(),
+            severity:   cls.severity,
+            ai_label:   cls.label,
+            confidence: cls.confidence
+        });
+        await msg.save();
+        res.json(msg);
+    } catch (err) {
+        console.error('Error in /api/simulate:', err);
+        res.status(500).json({ error: 'Failed to simulate message' });
+    }
 });
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/whatsapp_sessions';
 
-mongoose.connect(MONGODB_URI).then(async () => {
+mongoose.connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 10000,
+    socketTimeoutMS: 45000,
+}).then(async () => {
     console.log('MongoDB connected');
-
-    // On startup: clear stale QR codes; leave status unchanged so RemoteAuth
-    // can restore sessions without re-scanning QR
     await Tenant.updateMany({}, { qr: null });
     console.log('Cleared stale QR codes');
 
