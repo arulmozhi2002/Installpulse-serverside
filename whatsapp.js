@@ -193,9 +193,11 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
 
             if (loggedOut) {
                 await getAuthModel().deleteOne({ tenant_id: tenantId }).catch(() => {})
+                if (onDisconnected) onDisconnected()
+            } else {
+                // Delay reconnect to avoid rapid retry loops that trigger WhatsApp rate-limiting
+                setTimeout(() => { if (onDisconnected) onDisconnected() }, 8000)
             }
-
-            if (onDisconnected) onDisconnected()
         }
     })
 
@@ -260,12 +262,21 @@ async function initializeWhatsApp(tenantId, classifyFn, onInitError, onReady, on
 }
 
 async function requestPairingCode(tenantId, phoneNumber) {
-    const sock = activeClients.get(tenantId)
-    if (!sock) throw new Error('Client not initialised yet — wait a few seconds and try again')
-    if (!sockQrReady.get(tenantId)) throw new Error('Socket not ready yet — wait a few seconds and try again')
-    const digits = phoneNumber.replace(/\D/g, '')
-    const code = await sock.requestPairingCode(digits)
-    return code
+    // Wait up to 30s for the socket to connect and emit the QR event (QR-ready state)
+    const deadline = Date.now() + 30_000
+    while (Date.now() < deadline) {
+        const sock = activeClients.get(tenantId)
+        if (sock && sockQrReady.get(tenantId)) {
+            const digits = phoneNumber.replace(/\D/g, '')
+            return await sock.requestPairingCode(digits)
+        }
+        await new Promise(r => setTimeout(r, 800))
+    }
+    throw new Error('Socket not ready — server may still be starting, please try again')
+}
+
+async function clearAuthState(tenantId) {
+    await getAuthModel().deleteOne({ tenant_id: tenantId }).catch(() => {})
 }
 
 async function destroyClient(tenantId) {
@@ -289,4 +300,4 @@ async function destroyAllClients() {
     activeClients.clear()
 }
 
-module.exports = { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode }
+module.exports = { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode, clearAuthState }

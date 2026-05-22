@@ -2,12 +2,13 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const mongoose = require('mongoose')
-const { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode } = require('./whatsapp')
+const { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode, clearAuthState } = require('./whatsapp')
 
 const app = express()
 const port = process.env.PORT || 3000
 
-app.use(cors())
+const allowedOrigin = process.env.FRONTEND_URL || 'http://localhost:5173'
+app.use(cors({ origin: allowedOrigin }))
 app.use(express.json())
 
 // Keep server alive on unexpected errors; log for debugging
@@ -96,7 +97,7 @@ app.use(async (req, res, next) => {
 // ── Initialization tracker ───────────────────────────────────────────────────
 
 const initializingTenants = new Map(); // tenantId → startTime
-const INIT_TIMEOUT_MS = 60_000;        // 60s — Baileys connects in seconds, not minutes
+const INIT_TIMEOUT_MS = 300_000;       // 5 min — give users enough time to enter pairing code
 
 function needsInit(tenantId, status) {
     if (status !== 'disconnected' && status !== 'authenticating') return false;
@@ -150,7 +151,24 @@ app.post('/api/pair', async (req, res) => {
     const { phoneNumber } = req.body;
     if (!phoneNumber) return res.status(400).json({ error: 'phoneNumber required' });
     try {
+        // Always destroy any existing socket and wipe stored credentials so Baileys
+        // starts a clean connection. If credentials exist from a prior session Baileys
+        // reconnects silently (no QR event), sockQrReady never fires, and WhatsApp
+        // never sends the pairing notification to the phone.
+        await destroyClient(req.tenantId);
+        await clearAuthState(req.tenantId);
+        initializingTenants.delete(req.tenantId);
+        tenantCache.delete(req.tenantId);
+        await Tenant.updateOne(
+            { tenant_id: req.tenantId },
+            { status: 'disconnected', qr: null, number: '' }
+        );
+
+        startInit(req.tenantId);
+
         const code = await requestPairingCode(req.tenantId, phoneNumber);
+        // Reset init timer so the socket isn't destroyed while the user enters the code
+        initializingTenants.set(req.tenantId, Date.now());
         res.json({ code });
     } catch (err) {
         console.error('Error in /api/pair:', err.message);
@@ -202,8 +220,12 @@ app.get('/api/rules', (req, res) => {
 });
 
 app.post('/api/rules', async (req, res) => {
+    const { rules } = req.body;
+    if (!Array.isArray(rules)) return res.status(400).json({ error: 'rules must be an array' });
+    const valid = rules.every(r => r && typeof r.keyword === 'string' && typeof r.severity === 'string');
+    if (!valid) return res.status(400).json({ error: 'each rule must have keyword and severity' });
     try {
-        await Tenant.updateOne({ tenant_id: req.tenantId }, { rules: req.body.rules });
+        await Tenant.updateOne({ tenant_id: req.tenantId }, { rules });
         tenantCache.delete(req.tenantId);
         res.json({ success: true });
     } catch (err) {

@@ -8,9 +8,12 @@ RUN apt-get update \
 WORKDIR /usr/src/app
 
 COPY package*.json .npmrc ./
-RUN npm install
+RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+    && npm install
 
 COPY . .
 
 EXPOSE 3000
 CMD ["node", "--max-old-space-size=400", "index.js"]
+
+
