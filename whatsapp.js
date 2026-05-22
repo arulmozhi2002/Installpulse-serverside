@@ -36,52 +36,46 @@ function getAuthModel() {
 async function useMongoAuthState(tenantId) {
     const Model = getAuthModel()
 
-    const readAll = async () => {
-        const doc = await Model.findOne({ tenant_id: tenantId })
-        if (!doc || !doc.data || doc.data === '{}') {
-            return { creds: initAuthCreds(), keys: {} }
-        }
-        try { return JSON.parse(doc.data, BufferJSON.reviver) }
-        catch { return { creds: initAuthCreds(), keys: {} } }
+    // Load once into memory — Baileys calls keys.get() hundreds of times per
+    // connection; hitting MongoDB on every call causes OOM from query objects.
+    const doc = await Model.findOne({ tenant_id: tenantId })
+    let cached = { creds: initAuthCreds(), keys: {} }
+    if (doc?.data && doc.data !== '{}') {
+        try { cached = JSON.parse(doc.data, BufferJSON.reviver) } catch {}
     }
 
-    const writeAll = async (payload) => {
+    const persist = async () => {
         await Model.updateOne(
             { tenant_id: tenantId },
-            { data: JSON.stringify(payload, BufferJSON.replacer) },
+            { data: JSON.stringify(cached, BufferJSON.replacer) },
             { upsert: true }
         )
     }
 
-    const initial = await readAll()
-
     const state = {
-        creds: initial.creds,
+        creds: cached.creds,
         keys: {
             get: async (type, ids) => {
-                const all = await readAll()
                 const result = {}
-                for (const id of ids) result[id] = all.keys[`${type}-${id}`]
+                for (const id of ids) result[id] = cached.keys[`${type}-${id}`]
                 return result
             },
             set: async (data) => {
-                const all = await readAll()
                 for (const [type, values] of Object.entries(data)) {
                     for (const [id, value] of Object.entries(values || {})) {
                         const key = `${type}-${id}`
-                        if (value != null) all.keys[key] = value
-                        else delete all.keys[key]
+                        if (value != null) cached.keys[key] = value
+                        else delete cached.keys[key]
                     }
                 }
-                await writeAll(all)
+                await persist()
             }
         }
     }
 
     const saveCreds = async () => {
-        const all = await readAll()
-        all.creds = state.creds
-        await writeAll(all)
+        cached.creds = state.creds
+        await persist()
     }
 
     return { state, saveCreds }
