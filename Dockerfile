@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:20-slim
 
 # Build tools needed to compile @whiskeysockets/libsignal-node (native C++ module)
 RUN apt-get update \

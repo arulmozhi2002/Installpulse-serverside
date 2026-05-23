@@ -289,6 +289,18 @@ async function destroyClient(tenantId) {
     }
 }
 
+// Full logout: tells WhatsApp to unlink the device, then wipes local auth state
+async function logoutClient(tenantId) {
+    const sock = activeClients.get(tenantId)
+    if (sock) {
+        activeClients.delete(tenantId)
+        sockQrReady.delete(tenantId)
+        sock.ev.removeAllListeners()
+        try { await sock.logout() } catch { try { sock.end() } catch {} }
+    }
+    await getAuthModel().deleteOne({ tenant_id: tenantId }).catch(() => {})
+}
+
 async function destroyAllClients() {
     for (const [tenantId, sock] of activeClients.entries()) {
         console.log(`[${tenantId}] Destroying...`)
@@ -300,4 +312,4 @@ async function destroyAllClients() {
     activeClients.clear()
 }
 
-module.exports = { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode, clearAuthState }
+module.exports = { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode, clearAuthState, logoutClient }

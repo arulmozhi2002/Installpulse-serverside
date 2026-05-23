@@ -2,7 +2,7 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const mongoose = require('mongoose')
-const { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode, clearAuthState } = require('./whatsapp')
+const { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode, clearAuthState, logoutClient } = require('./whatsapp')
 
 const app = express()
 const port = process.env.PORT || 3000
@@ -176,10 +176,10 @@ app.post('/api/pair', async (req, res) => {
     }
 });
 
-// Force logout + destroy session → triggers fresh QR on next status poll
+// Logout: unlinks device from WhatsApp, wipes saved credentials, resets state
 app.post('/api/logout', async (req, res) => {
     try {
-        await destroyClient(req.tenantId);
+        await logoutClient(req.tenantId);
         initializingTenants.delete(req.tenantId);
         await Tenant.updateOne(
             { tenant_id: req.tenantId },
