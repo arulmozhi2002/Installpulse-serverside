@@ -7,8 +7,17 @@ const { initializeWhatsApp, destroyClient, destroyAllClients, requestPairingCode
 const app = express()
 const port = process.env.PORT || 3000
 
-const allowedOrigin = process.env.FRONTEND_URL || 'http://localhost:5173'
-app.use(cors({ origin: allowedOrigin }))
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://installpulse-frontend.vercel.app',
+  ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : [])
+]
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true)
+    callback(new Error('Not allowed by CORS'))
+  }
+}))
 app.use(express.json())
 
 // Keep server alive on unexpected errors; log for debugging
